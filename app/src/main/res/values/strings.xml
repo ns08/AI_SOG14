@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MorseVoiceAI</string>
+    <string name="accessibility_service_desc">音声コマンドやWeb遠隔操作でタップ・スワイプ・文字入力・LINE通話・Teams返信・Amazon操作を実行します。</string>
+</resources>
