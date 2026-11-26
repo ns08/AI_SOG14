@@ -1,6 +1,7 @@
 package com.soni08.morseai.service
 
 import android.Manifest
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,6 +10,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,6 +30,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telecom.TelecomManager
+import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.soni08.morseai.ai.LocalAiClient
@@ -32,6 +41,7 @@ import com.soni08.morseai.shopping.AmazonOrderHelper
 import com.soni08.morseai.text.HiraganaNormalizer
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -50,13 +60,18 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         const val NOTIF_ID = 1001
         const val ACTION_STOP = "com.soni08.morseai.STOP"
         const val ACTION_INCOMING_CALL = "com.soni08.morseai.INCOMING_CALL"
-        const val ACTION_ENABLE_MEDIA_PROJECTION = "com.soni08.morseai.ENABLE_MEDIA_PROJECTION"
+        const val ACTION_START_SCREEN_SHARE = "com.soni08.morseai.START_SCREEN_SHARE"
+        const val ACTION_STOP_SCREEN_SHARE = "com.soni08.morseai.STOP_SCREEN_SHARE"
+
         const val EXTRA_INCOMING_NUMBER = "incoming_number"
         const val EXTRA_LOCAL_AI_URL = "local_ai_url"
         const val EXTRA_LOCAL_AI_MODEL = "local_ai_model"
         const val EXTRA_RELAY_URL = "relay_url"
         const val EXTRA_DEVICE_ID = "device_id"
         const val EXTRA_TOKEN = "token"
+        const val EXTRA_PROJECTION_RESULT_CODE = "projection_result_code"
+        const val EXTRA_PROJECTION_DATA = "projection_data"
+
         const val BROADCAST_LOG = "com.soni08.morseai.LOG"
         const val EXTRA_LOG_MSG = "log_msg"
 
@@ -71,13 +86,14 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             instance?.onIncomingAppCallDetected(appName, detail)
         }
 
-        fun setMediaProjectionAuthorized(authorized: Boolean) {
-            instance?.updateMediaProjectionType(authorized)
+        fun isScreenSharingActive(): Boolean {
+            return instance?.mediaProjection != null
         }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val networkExecutor = Executors.newSingleThreadExecutor()
+    private val screenUploadExecutor = Executors.newSingleThreadExecutor()
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var localAiUrl: String = "http://127.0.0.1:8080"
@@ -94,6 +110,16 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     @Volatile
     private var phoneCallActive: Boolean = false
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+
+    @Volatile
+    private var isUploadingFrame: Boolean = false
+
+    @Volatile
+    private var lastFrameSentAt: Long = 0L
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -177,7 +203,6 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 }
                 return
             } catch (_: SecurityException) {
-                // mediaProjection やマイク権限が未付与の場合は除外してフォールバック
                 mediaProjectionAuthorized = false
                 val fallbackType = computeForegroundServiceType()
                 try {
@@ -196,23 +221,19 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         startForeground(NOTIF_ID, notification)
     }
 
-    private fun updateMediaProjectionType(authorized: Boolean) {
-        mediaProjectionAuthorized = authorized
-        if (!isStopping) {
-            mainHandler.post {
-                startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
-            }
-        }
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            stopScreenCapture()
             stopSelf()
             return START_NOT_STICKY
         }
 
-        if (intent?.action == ACTION_ENABLE_MEDIA_PROJECTION) {
-            mediaProjectionAuthorized = true
+        if (intent?.action == ACTION_STOP_SCREEN_SHARE) {
+            stopScreenCapture()
+            mediaProjectionAuthorized = false
+            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+            sendLog("がめんみらーりんぐを ていししました")
+            return START_STICKY
         }
 
         if (intent?.action == ACTION_INCOMING_CALL) {
@@ -226,7 +247,32 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         intent?.getStringExtra(EXTRA_DEVICE_ID)?.takeIf { it.isNotBlank() }?.let { deviceId = it }
         intent?.getStringExtra(EXTRA_TOKEN)?.takeIf { it.isNotBlank() }?.let { token = it }
 
-        startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+        if (intent?.action == ACTION_START_SCREEN_SHARE) {
+            val resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
+            val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
+            }
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                mediaProjectionAuthorized = true
+                startForegroundSafely("がめんみらーりんぐ・おんせいにんしき かどうちゅう")
+                startScreenCapture(resultCode, data)
+            } else {
+                mediaProjectionAuthorized = false
+                startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+                sendLog("がめんきゃぷちゃの きょかが えられませんでした")
+            }
+        } else {
+            val statusText = if (mediaProjection != null) {
+                "がめんみらーりんぐ・おんせいにんしき かどうちゅう"
+            } else {
+                "おんせいにんしき・すりーぷたいおう かどうちゅう"
+            }
+            startForegroundSafely(statusText)
+        }
+
         autoStartLocalAiAtLaunch()
         startSpeechRecognitionLoop()
 
@@ -241,6 +287,180 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
 
         return START_STICKY
+    }
+
+    private fun startScreenCapture(resultCode: Int, data: Intent) {
+        stopScreenCapture()
+        try {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+            val projection = mpm?.getMediaProjection(resultCode, data)
+            if (projection == null) {
+                mediaProjectionAuthorized = false
+                sendLog("MediaProjection の しゅとくにしっぱいしました")
+                return
+            }
+
+            projection.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    mainHandler.post {
+                        stopScreenCapture()
+                        mediaProjectionAuthorized = false
+                        if (!isStopping) {
+                            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+                            sendLog("がめんみらーりんぐが しゅうりょうしました")
+                        }
+                    }
+                }
+            }, mainHandler)
+
+            val metrics = resources.displayMetrics
+            val rawW = metrics.widthPixels.coerceAtLeast(360)
+            val rawH = metrics.heightPixels.coerceAtLeast(640)
+            val scale = if (rawW > 540) 540f / rawW.toFloat() else 1f
+            val captureW = ((rawW * scale).toInt() / 2) * 2
+            val captureH = ((rawH * scale).toInt() / 2) * 2
+            val density = metrics.densityDpi
+
+            val reader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
+            reader.setOnImageAvailableListener({ r ->
+                val image = try {
+                    r.acquireLatestImage()
+                } catch (_: Exception) {
+                    null
+                } ?: return@setOnImageAvailableListener
+
+                val now = System.currentTimeMillis()
+                if (isUploadingFrame || now - lastFrameSentAt < 450L) {
+                    image.close()
+                    return@setOnImageAvailableListener
+                }
+
+                try {
+                    val planes = image.planes
+                    if (planes.isEmpty()) {
+                        image.close()
+                        return@setOnImageAvailableListener
+                    }
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * captureW
+
+                    val paddedBitmap = Bitmap.createBitmap(
+                        captureW + rowPadding / pixelStride,
+                        captureH,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    paddedBitmap.copyPixelsFromBuffer(buffer)
+                    image.close()
+
+                    val croppedBitmap = if (rowPadding == 0) {
+                        paddedBitmap
+                    } else {
+                        Bitmap.createBitmap(paddedBitmap, 0, 0, captureW, captureH).also {
+                            paddedBitmap.recycle()
+                        }
+                    }
+
+                    isUploadingFrame = true
+                    lastFrameSentAt = now
+                    screenUploadExecutor.execute {
+                        try {
+                            val baos = ByteArrayOutputStream()
+                            croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 55, baos)
+                            val jpegBytes = baos.toByteArray()
+                            val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+                            uploadScreenFrame(base64Image, captureW, captureH)
+                        } catch (_: Exception) {
+                        } finally {
+                            croppedBitmap.recycle()
+                            isUploadingFrame = false
+                        }
+                    }
+                } catch (_: Exception) {
+                    try {
+                        image.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }, mainHandler)
+
+            val display = projection.createVirtualDisplay(
+                "MorseVoiceAIScreenMirror",
+                captureW,
+                captureH,
+                density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                null,
+                mainHandler
+            )
+
+            mediaProjection = projection
+            imageReader = reader
+            virtualDisplay = display
+            sendLog("がめんみらーりんぐを かいししました (${captureW}x${captureH})")
+        } catch (e: SecurityException) {
+            mediaProjectionAuthorized = false
+            stopScreenCapture()
+            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+            sendLog("がめんきゃぷちゃけんげんえらー: ${e.message}")
+        } catch (e: Exception) {
+            stopScreenCapture()
+            sendLog("がめんみらーりんぐかいしえらー: ${e.message}")
+        }
+    }
+
+    private fun uploadScreenFrame(base64Jpeg: String, width: Int, height: Int) {
+        if (relayUrl.isBlank() || isStopping) return
+        val conn = (URL(relayUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 4000
+            readTimeout = 6000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            val payload = JSONObject().apply {
+                put("role", "device_screen")
+                put("action", "upload_frame")
+                put("device_id", deviceId)
+                put("token", token)
+                put("width", width)
+                put("height", height)
+                put("mime", "image/jpeg")
+                put("frame_base64", base64Jpeg)
+                put("timestamp", System.currentTimeMillis())
+            }
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
+                it.write(payload.toString())
+            }
+            conn.responseCode
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun stopScreenCapture() {
+        try {
+            virtualDisplay?.release()
+        } catch (_: Exception) {
+        }
+        virtualDisplay = null
+
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.close()
+        } catch (_: Exception) {
+        }
+        imageReader = null
+
+        try {
+            mediaProjection?.stop()
+        } catch (_: Exception) {
+        }
+        mediaProjection = null
+        isUploadingFrame = false
     }
 
     private fun handleIncomingPhoneCall(rawNumber: String) {
@@ -755,6 +975,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         isStopping = true
+        stopScreenCapture()
         if (instance === this) instance = null
         AppNotificationListenerService.onNewNotificationCallback = null
         mainHandler.post {
@@ -771,6 +992,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
         wakeLock = null
         networkExecutor.shutdownNow()
+        screenUploadExecutor.shutdownNow()
         super.onDestroy()
     }
 
