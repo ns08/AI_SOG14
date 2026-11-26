@@ -372,20 +372,20 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
 
         if (hiraText.contains("あまぞん")) {
-            val kw = rawText.replace(Regex("(Amazon|アマゾン|あまぞん|で|を|注文して|注文|検索して|検索)"), "").trim()
+            val kw = rawText.replace(Regex("""(Amazon|アマゾン|あまぞん|で|を|注文して|注文|検索して|検索)"""), "").trim()
             AmazonOrderHelper.openAmazonSearch(this, kw)
             speakHiragana("あまぞんで $kw を ひらきました")
             return
         }
 
         if (hiraText.contains("おんがく") || hiraText.contains("きょく")) {
-            val kw = rawText.replace(Regex("(本体|ほんたい|の|音楽|おんがく|曲|きょく|を|再生して|再生)"), "").trim()
+            val kw = rawText.replace(Regex("""(本体|ほんたい|の|音楽|おんがく|曲|きょく|を|再生して|再生)"""), "").trim()
             val ok = LocalMusicPlayer.playLocalMusic(this, kw)
             speakHiragana(if (ok) "ほんたいのおんがくを さいせいします" else "がいとうするきょくが みつかりませんでした")
             return
         }
 
-        val callTargetMatch = Regex("^(.+?)(?:にでんわして|でんわをかけて|でんわして)$").find(hiraText)
+        val callTargetMatch = Regex("""^(.+?)(?:にでんわして|でんわをかけて|でんわして)$""").find(hiraText)
         if (callTargetMatch != null) {
             val target = callTargetMatch.groupValues[1].trim()
             val digits = target.filter { it.isDigit() || it == '+' }
@@ -406,7 +406,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        val teamsReplyMatch = Regex("^(?:てぃーむずで|ちーむずで)?\s*(.+?)(?:にへんしんして|とへんしんして|へへんしんして|とおくって)$").find(hiraText)
+        val teamsReplyMatch = Regex("""^(?:てぃーむずで|ちーむずで)?\s*(.+?)(?:にへんしんして|とへんしんして|へへんしんして|とおくって)$""").find(hiraText)
         if (teamsReplyMatch != null && (hiraText.contains("てぃーむず") || hiraText.contains("ちーむず") || hiraText.contains("へんしん"))) {
             replyToTeamsMessage(teamsReplyMatch.groupValues[1].trim())
             return
@@ -432,7 +432,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
         val rawCandidate = rawText
-            .replace(Regex("(に電話して|にでんわして|電話をかけて|でんわをかけて|電話して|でんわして)$"), "")
+            .replace(Regex("""(に電話して|にでんわして|電話をかけて|でんわをかけて|電話して|でんわして)$"""), "")
             .trim()
         val candidates = ContactPhoneLookup.findCandidatesByName(this, rawCandidate)
             .ifEmpty { ContactPhoneLookup.findCandidatesByName(this, hiraTargetName) }
