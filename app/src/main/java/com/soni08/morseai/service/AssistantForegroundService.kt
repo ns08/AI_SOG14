@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -49,6 +50,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         const val NOTIF_ID = 1001
         const val ACTION_STOP = "com.soni08.morseai.STOP"
         const val ACTION_INCOMING_CALL = "com.soni08.morseai.INCOMING_CALL"
+        const val ACTION_ENABLE_MEDIA_PROJECTION = "com.soni08.morseai.ENABLE_MEDIA_PROJECTION"
         const val EXTRA_INCOMING_NUMBER = "incoming_number"
         const val EXTRA_LOCAL_AI_URL = "local_ai_url"
         const val EXTRA_LOCAL_AI_MODEL = "local_ai_model"
@@ -68,6 +70,10 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         fun notifyIncomingCallEvent(appName: String, detail: String) {
             instance?.onIncomingAppCallDetected(appName, detail)
         }
+
+        fun setMediaProjectionAuthorized(authorized: Boolean) {
+            instance?.updateMediaProjectionType(authorized)
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -82,6 +88,12 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     @Volatile
     private var aiChatEnabled: Boolean = false
+
+    @Volatile
+    private var mediaProjectionAuthorized: Boolean = false
+
+    @Volatile
+    private var phoneCallActive: Boolean = false
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -124,10 +136,87 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun computeForegroundServiceType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return 0
+        }
+        var type = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val hasMicPerm = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasMicPerm) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (phoneCallActive) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+            }
+            if (mediaProjectionAuthorized) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+        } else {
+            if (mediaProjectionAuthorized) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+        }
+        return type
+    }
+
+    private fun startForegroundSafely(content: String) {
+        val notification = buildNotification(content)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val desiredType = computeForegroundServiceType()
+            try {
+                if (desiredType != 0) {
+                    startForeground(NOTIF_ID, notification, desiredType)
+                } else {
+                    startForeground(NOTIF_ID, notification)
+                }
+                return
+            } catch (_: SecurityException) {
+                // mediaProjection やマイク権限が未付与の場合は除外してフォールバック
+                mediaProjectionAuthorized = false
+                val fallbackType = computeForegroundServiceType()
+                try {
+                    if (fallbackType != 0) {
+                        startForeground(NOTIF_ID, notification, fallbackType)
+                    } else {
+                        startForeground(NOTIF_ID, notification)
+                    }
+                    return
+                } catch (_: SecurityException) {
+                    startForeground(NOTIF_ID, notification)
+                    return
+                }
+            }
+        }
+        startForeground(NOTIF_ID, notification)
+    }
+
+    private fun updateMediaProjectionType(authorized: Boolean) {
+        mediaProjectionAuthorized = authorized
+        if (!isStopping) {
+            mainHandler.post {
+                startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+            }
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (intent?.action == ACTION_ENABLE_MEDIA_PROJECTION) {
+            mediaProjectionAuthorized = true
+        }
+
+        if (intent?.action == ACTION_INCOMING_CALL) {
+            phoneCallActive = true
         }
 
         acquirePersistentWakeLock()
@@ -137,7 +226,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         intent?.getStringExtra(EXTRA_DEVICE_ID)?.takeIf { it.isNotBlank() }?.let { deviceId = it }
         intent?.getStringExtra(EXTRA_TOKEN)?.takeIf { it.isNotBlank() }?.let { token = it }
 
-        startForeground(NOTIF_ID, buildNotification("おんせいにんしき・すりーぷたいおう かどうちゅう"))
+        startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
         autoStartLocalAiAtLaunch()
         startSpeechRecognitionLoop()
 
@@ -155,6 +244,8 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun handleIncomingPhoneCall(rawNumber: String) {
+        phoneCallActive = true
+        startForegroundSafely("ちゃくしんたいおう・えーあいかどうちゅう")
         aiChatEnabled = true
         autoStartLocalAiAtLaunch()
 
@@ -188,6 +279,8 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     private fun onIncomingAppCallDetected(appName: String, detail: String) {
         if (isStopping) return
+        phoneCallActive = true
+        startForegroundSafely("ちゃくしんたいおう・えーあいかどうちゅう")
         aiChatEnabled = true
         autoStartLocalAiAtLaunch()
         val msg = "$appName から ちゃくしんが あります。$detail。えーあいを じどうきどう しました。"
@@ -491,6 +584,8 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             speakHiragana("でんわはっしんの けんげんが ありません")
             return
         }
+        phoneCallActive = true
+        startForegroundSafely("つうちゅう・えーあいかどうちゅう")
         startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:$phoneNumber")).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
         speakHiragana("$label に でんわを かけます")
     }
