@@ -21,7 +21,7 @@ object HiraganaNormalizer {
             .replace("teams", "てぃーむず")
             .replace("Amazon", "あまぞん")
             .replace("amazon", "あまぞん")
-            .replace(Regex("\s+"), " ")
+            .replace(Regex("""\s+"""), " ")
             .trim()
     }
 
