@@ -6,34 +6,42 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.soni08.morseai.service.AssistantForegroundService
+import com.soni08.morseai.service.MicInputMode
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var editLocalAiUrl: EditText
-    private lateinit var editLocalAiModel: EditText
+    private lateinit var editGeminiApiKey: EditText
+    private lateinit var editGeminiModel: EditText
     private lateinit var editRelayUrl: EditText
     private lateinit var editDeviceId: EditText
     private lateinit var editToken: EditText
+    private lateinit var checkAutoShare: CheckBox
+    private lateinit var radioMicGroup: RadioGroup
+    private lateinit var radioSog14Only: RadioButton
+    private lateinit var radioControllerOnly: RadioButton
     private lateinit var textLog: TextView
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        startAssistantService()
+        startAssistantService(requestAutoShare = checkAutoShare.isChecked)
     }
 
     private val screenCaptureLauncher = registerForActivityResult(
@@ -45,11 +53,13 @@ class MainActivity : ComponentActivity() {
                 action = AssistantForegroundService.ACTION_START_SCREEN_SHARE
                 putExtra(AssistantForegroundService.EXTRA_PROJECTION_RESULT_CODE, result.resultCode)
                 putExtra(AssistantForegroundService.EXTRA_PROJECTION_DATA, result.data)
-                putExtra(AssistantForegroundService.EXTRA_LOCAL_AI_URL, editLocalAiUrl.text.toString().trim())
-                putExtra(AssistantForegroundService.EXTRA_LOCAL_AI_MODEL, editLocalAiModel.text.toString().trim())
+                putExtra(AssistantForegroundService.EXTRA_GEMINI_API_KEY, editGeminiApiKey.text.toString().trim())
+                putExtra(AssistantForegroundService.EXTRA_GEMINI_MODEL, editGeminiModel.text.toString().trim())
                 putExtra(AssistantForegroundService.EXTRA_RELAY_URL, editRelayUrl.text.toString().trim())
                 putExtra(AssistantForegroundService.EXTRA_DEVICE_ID, editDeviceId.text.toString().trim())
                 putExtra(AssistantForegroundService.EXTRA_TOKEN, editToken.text.toString().trim())
+                putExtra(AssistantForegroundService.EXTRA_MIC_MODE, currentMicMode().wireValue)
+                putExtra(AssistantForegroundService.EXTRA_AUTO_SHARE_ON_START, checkAutoShare.isChecked)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
@@ -71,20 +81,31 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+
         val prefs = getSharedPreferences("morse_voice_ai_prefs", Context.MODE_PRIVATE)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 32, 32, 32)
+            setPadding(28, 28, 28, 28)
         }
 
-        editLocalAiUrl = EditText(this).apply {
-            hint = "ローカルAI URL"
-            setText(prefs.getString("local_ai_url", "http://127.0.0.1:8080"))
+        editGeminiApiKey = EditText(this).apply {
+            hint = "Gemini API Key (AIza...)"
+            setText(prefs.getString("gemini_api_key", ""))
         }
-        editLocalAiModel = EditText(this).apply {
-            hint = "ローカルAI モデル名"
-            setText(prefs.getString("local_ai_model", "local-model"))
+        editGeminiModel = EditText(this).apply {
+            hint = "Gemini モデル名 (例: gemini-2.5-flash)"
+            setText(prefs.getString("gemini_model", "gemini-2.5-flash"))
         }
         editRelayUrl = EditText(this).apply {
             hint = "リレーサーバー URL"
@@ -99,35 +120,60 @@ class MainActivity : ComponentActivity() {
             setText(prefs.getString("token", "change-me-token"))
         }
 
+        checkAutoShare = CheckBox(this).apply {
+            text = "アプリ起動・復帰時に画面共有を自動開始"
+            isChecked = prefs.getBoolean("auto_share_on_start", true)
+        }
+
+        val savedMode = MicInputMode.fromWire(prefs.getString("mic_mode", MicInputMode.SOG14_ONLY.wireValue))
+        radioSog14Only = RadioButton(this).apply {
+            id = 10001
+            text = "マイク: SOG14 本体マイクのみ"
+            isChecked = savedMode == MicInputMode.SOG14_ONLY
+        }
+        radioControllerOnly = RadioButton(this).apply {
+            id = 10002
+            text = "マイク: 遠隔操作側マイクのみ"
+            isChecked = savedMode == MicInputMode.CONTROLLER_ONLY
+        }
+        radioMicGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            addView(radioSog14Only)
+            addView(radioControllerOnly)
+            setOnCheckedChangeListener { _, _ ->
+                savePrefs()
+                pushMicModeToService()
+            }
+        }
+
         val btnStartService = Button(this).apply {
-            text = "音声AI・リレー開始（設定保存）"
+            text = "設定保存・サービス開始"
             setOnClickListener {
                 savePrefs()
-                requestPermissionsAndStart()
+                requestPermissionsAndStart(triggerShare = checkAutoShare.isChecked)
             }
         }
 
         val btnStartMirror = Button(this).apply {
-            text = "Web画面ミラーリング開始"
+            text = "画面共有を今すぐ開始"
             setOnClickListener {
                 savePrefs()
-                startAssistantService()
+                startAssistantService(requestAutoShare = false)
                 requestScreenCapturePermission()
             }
         }
 
         val btnStopMirror = Button(this).apply {
-            text = "Web画面ミラーリング停止"
+            text = "画面共有を停止"
             setOnClickListener {
-                val stopIntent = Intent(this@MainActivity, AssistantForegroundService::class.java).apply {
+                startService(Intent(this@MainActivity, AssistantForegroundService::class.java).apply {
                     action = AssistantForegroundService.ACTION_STOP_SCREEN_SHARE
-                }
-                startService(stopIntent)
+                })
             }
         }
 
         val btnAccessibility = Button(this).apply {
-            text = "ユーザー補助設定を開く（遠隔操作用）"
+            text = "ユーザー補助設定を開く"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
@@ -136,10 +182,9 @@ class MainActivity : ComponentActivity() {
         val btnStopAll = Button(this).apply {
             text = "サービス完全停止"
             setOnClickListener {
-                val stopIntent = Intent(this@MainActivity, AssistantForegroundService::class.java).apply {
+                startService(Intent(this@MainActivity, AssistantForegroundService::class.java).apply {
                     action = AssistantForegroundService.ACTION_STOP
-                }
-                startService(stopIntent)
+                })
             }
         }
 
@@ -151,11 +196,13 @@ class MainActivity : ComponentActivity() {
             addView(textLog)
         }
 
-        root.addView(editLocalAiUrl)
-        root.addView(editLocalAiModel)
+        root.addView(editGeminiApiKey)
+        root.addView(editGeminiModel)
         root.addView(editRelayUrl)
         root.addView(editDeviceId)
         root.addView(editToken)
+        root.addView(checkAutoShare)
+        root.addView(radioMicGroup)
         root.addView(btnStartService)
         root.addView(btnStartMirror)
         root.addView(btnStopMirror)
@@ -168,7 +215,22 @@ class MainActivity : ComponentActivity() {
         ))
 
         setContentView(root)
-        requestPermissionsAndStart()
+        handleIncomingIntentAction(intent)
+        requestPermissionsAndStart(triggerShare = checkAutoShare.isChecked)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntentAction(intent)
+    }
+
+    private fun handleIncomingIntentAction(intent: Intent?) {
+        if (intent?.action == AssistantForegroundService.ACTION_REQUEST_SCREEN_SHARE_UI) {
+            if (!AssistantForegroundService.isScreenSharingActive()) {
+                requestScreenCapturePermission()
+            }
+        }
     }
 
     override fun onStart() {
@@ -190,17 +252,35 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    private fun currentMicMode(): MicInputMode {
+        return if (radioControllerOnly.isChecked) MicInputMode.CONTROLLER_ONLY else MicInputMode.SOG14_ONLY
+    }
+
     private fun savePrefs() {
         getSharedPreferences("morse_voice_ai_prefs", Context.MODE_PRIVATE).edit()
-            .putString("local_ai_url", editLocalAiUrl.text.toString().trim())
-            .putString("local_ai_model", editLocalAiModel.text.toString().trim())
+            .putString("gemini_api_key", editGeminiApiKey.text.toString().trim())
+            .putString("gemini_model", editGeminiModel.text.toString().trim())
             .putString("relay_url", editRelayUrl.text.toString().trim())
             .putString("device_id", editDeviceId.text.toString().trim())
             .putString("token", editToken.text.toString().trim())
+            .putBoolean("auto_share_on_start", checkAutoShare.isChecked)
+            .putString("mic_mode", currentMicMode().wireValue)
             .apply()
     }
 
-    private fun requestPermissionsAndStart() {
+    private fun pushMicModeToService() {
+        val intent = Intent(this, AssistantForegroundService::class.java).apply {
+            action = AssistantForegroundService.ACTION_SET_MIC_MODE
+            putExtra(AssistantForegroundService.EXTRA_MIC_MODE, currentMicMode().wireValue)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    private fun requestPermissionsAndStart(triggerShare: Boolean) {
         val perms = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_PHONE_STATE,
@@ -219,19 +299,21 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isEmpty()) {
-            startAssistantService()
+            startAssistantService(requestAutoShare = triggerShare)
         } else {
             permissionLauncher.launch(missing.toTypedArray())
         }
     }
 
-    private fun startAssistantService() {
+    private fun startAssistantService(requestAutoShare: Boolean) {
         val intent = Intent(this, AssistantForegroundService::class.java).apply {
-            putExtra(AssistantForegroundService.EXTRA_LOCAL_AI_URL, editLocalAiUrl.text.toString().trim())
-            putExtra(AssistantForegroundService.EXTRA_LOCAL_AI_MODEL, editLocalAiModel.text.toString().trim())
+            putExtra(AssistantForegroundService.EXTRA_GEMINI_API_KEY, editGeminiApiKey.text.toString().trim())
+            putExtra(AssistantForegroundService.EXTRA_GEMINI_MODEL, editGeminiModel.text.toString().trim())
             putExtra(AssistantForegroundService.EXTRA_RELAY_URL, editRelayUrl.text.toString().trim())
             putExtra(AssistantForegroundService.EXTRA_DEVICE_ID, editDeviceId.text.toString().trim())
             putExtra(AssistantForegroundService.EXTRA_TOKEN, editToken.text.toString().trim())
+            putExtra(AssistantForegroundService.EXTRA_MIC_MODE, currentMicMode().wireValue)
+            putExtra(AssistantForegroundService.EXTRA_AUTO_SHARE_ON_START, requestAutoShare)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
