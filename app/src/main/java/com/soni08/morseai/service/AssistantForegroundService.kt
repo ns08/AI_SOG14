@@ -11,9 +11,13 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -33,15 +37,17 @@ import android.telecom.TelecomManager
 import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.soni08.morseai.ai.LocalAiClient
 import com.soni08.morseai.contacts.ContactPhoneLookup
 import com.soni08.morseai.contacts.MatchedContact
 import com.soni08.morseai.media.LocalMusicPlayer
 import com.soni08.morseai.shopping.AmazonOrderHelper
 import com.soni08.morseai.text.HiraganaNormalizer
+import com.soni08.morseai.ui.MainActivity
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -53,29 +59,44 @@ data class PendingContactSelection(
     val candidates: List<MatchedContact>
 )
 
+enum class MicInputMode(val wireValue: String) {
+    SOG14_ONLY("sog14_only"),
+    CONTROLLER_ONLY("controller_only");
+
+    companion object {
+        fun fromWire(value: String?): MicInputMode {
+            return entries.firstOrNull { it.wireValue.equals(value, ignoreCase = true) } ?: SOG14_ONLY
+        }
+    }
+}
+
 class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     companion object {
         const val CHANNEL_ID = "morse_voice_ai_channel"
         const val NOTIF_ID = 1001
+
         const val ACTION_STOP = "com.soni08.morseai.STOP"
         const val ACTION_INCOMING_CALL = "com.soni08.morseai.INCOMING_CALL"
         const val ACTION_START_SCREEN_SHARE = "com.soni08.morseai.START_SCREEN_SHARE"
         const val ACTION_STOP_SCREEN_SHARE = "com.soni08.morseai.STOP_SCREEN_SHARE"
+        const val ACTION_REQUEST_SCREEN_SHARE_UI = "com.soni08.morseai.REQUEST_SCREEN_SHARE_UI"
+        const val ACTION_SET_MIC_MODE = "com.soni08.morseai.SET_MIC_MODE"
 
         const val EXTRA_INCOMING_NUMBER = "incoming_number"
-        const val EXTRA_LOCAL_AI_URL = "local_ai_url"
-        const val EXTRA_LOCAL_AI_MODEL = "local_ai_model"
+        const val EXTRA_GEMINI_API_KEY = "gemini_api_key"
+        const val EXTRA_GEMINI_MODEL = "gemini_model"
         const val EXTRA_RELAY_URL = "relay_url"
         const val EXTRA_DEVICE_ID = "device_id"
         const val EXTRA_TOKEN = "token"
+        const val EXTRA_MIC_MODE = "mic_mode"
+        const val EXTRA_AUTO_SHARE_ON_START = "auto_share_on_start"
         const val EXTRA_PROJECTION_RESULT_CODE = "projection_result_code"
         const val EXTRA_PROJECTION_DATA = "projection_data"
 
         const val BROADCAST_LOG = "com.soni08.morseai.LOG"
         const val EXTRA_LOG_MSG = "log_msg"
 
-        private const val PKG_TERMUX = "com.termux"
         private const val PKG_LINE = "jp.naver.line.android"
         private const val PKG_TEAMS = "com.microsoft.teams"
 
@@ -94,22 +115,34 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val screenUploadExecutor = Executors.newSingleThreadExecutor()
+    private val mediaIoExecutor = Executors.newSingleThreadExecutor()
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private var localAiUrl: String = "http://127.0.0.1:8080"
-    private var localAiModel: String = "local-model"
+    private var screenWakeLock: PowerManager.WakeLock? = null
+
+    private var geminiApiKey: String = ""
+    private var geminiModel: String = "gemini-2.5-flash"
     private var relayUrl: String = "https://soni08.website/remote/relay.php"
     private var deviceId: String = "sog14-main"
     private var token: String = "change-me-token"
 
     @Volatile
-    private var aiChatEnabled: Boolean = false
+    private var micInputMode: MicInputMode = MicInputMode.SOG14_ONLY
+
+    @Volatile
+    private var autoShareOnStart: Boolean = true
+
+    @Volatile
+    private var aiChatEnabled: Boolean = true
 
     @Volatile
     private var mediaProjectionAuthorized: Boolean = false
 
     @Volatile
     private var phoneCallActive: Boolean = false
+
+    @Volatile
+    private var lastAutoSharePromptAt: Long = 0L
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -124,6 +157,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var speechRecognizer: SpeechRecognizer? = null
+    private var speakerOutTrack: AudioTrack? = null
 
     @Volatile
     private var isSpeaking = false
@@ -139,6 +173,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         instance = this
         acquirePersistentWakeLock()
         createNotificationChannel()
+        initSpeakerOutTrack()
         tts = TextToSpeech(this, this)
         AppNotificationListenerService.onNewNotificationCallback = { item ->
             if (AppNotificationListenerService.isRecordingSinceTrigger && !isSpeaking) {
@@ -149,15 +184,76 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     private fun acquirePersistentWakeLock() {
         try {
-            if (wakeLock?.isHeld == true) return
+            if (wakeLock?.isHeld != true) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+                wakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "MorseVoiceAI::SleepKeepAliveWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun wakeDeviceFromSleep() {
+        acquirePersistentWakeLock()
+        try {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "MorseVoiceAI::SleepKeepAliveWakeLock"
+            @Suppress("DEPRECATION")
+            val wl = pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "MorseVoiceAI::WakeScreenForMirror"
             ).apply {
                 setReferenceCounted(false)
-                acquire()
+                acquire(10_000L)
             }
+            screenWakeLock = wl
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun initSpeakerOutTrack() {
+        try {
+            val sampleRate = 16000
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val bufSize = minBuf.coerceAtLeast(4096)
+            speakerOutTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufSize)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+            } else {
+                @Suppress("DEPRECATION")
+                AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC,
+                    sampleRate,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize,
+                    AudioTrack.MODE_STREAM
+                )
+            }
+            speakerOutTrack?.play()
         } catch (_: Exception) {
         }
     }
@@ -172,7 +268,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 this,
                 Manifest.permission.RECORD_AUDIO
             ) == PackageManager.PERMISSION_GRANTED
-            if (hasMicPerm) {
+            if (hasMicPerm && micInputMode == MicInputMode.SOG14_ONLY) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
         }
@@ -231,7 +327,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         if (intent?.action == ACTION_STOP_SCREEN_SHARE) {
             stopScreenCapture()
             mediaProjectionAuthorized = false
-            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+            startForegroundSafely("まいくもーど: ${micInputMode.wireValue}")
             sendLog("がめんみらーりんぐを ていししました")
             return START_STICKY
         }
@@ -241,11 +337,25 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
 
         acquirePersistentWakeLock()
-        intent?.getStringExtra(EXTRA_LOCAL_AI_URL)?.takeIf { it.isNotBlank() }?.let { localAiUrl = it }
-        intent?.getStringExtra(EXTRA_LOCAL_AI_MODEL)?.takeIf { it.isNotBlank() }?.let { localAiModel = it }
+
+        intent?.getStringExtra(EXTRA_GEMINI_API_KEY)?.takeIf { it.isNotBlank() }?.let { geminiApiKey = it }
+        intent?.getStringExtra(EXTRA_GEMINI_MODEL)?.takeIf { it.isNotBlank() }?.let { geminiModel = it }
         intent?.getStringExtra(EXTRA_RELAY_URL)?.takeIf { it.isNotBlank() }?.let { relayUrl = it }
         intent?.getStringExtra(EXTRA_DEVICE_ID)?.takeIf { it.isNotBlank() }?.let { deviceId = it }
         intent?.getStringExtra(EXTRA_TOKEN)?.takeIf { it.isNotBlank() }?.let { token = it }
+        if (intent?.hasExtra(EXTRA_AUTO_SHARE_ON_START) == true) {
+            autoShareOnStart = intent.getBooleanExtra(EXTRA_AUTO_SHARE_ON_START, true)
+        }
+        intent?.getStringExtra(EXTRA_MIC_MODE)?.takeIf { it.isNotBlank() }?.let {
+            applyMicMode(MicInputMode.fromWire(it), announce = false)
+        }
+
+        if (intent?.action == ACTION_SET_MIC_MODE) {
+            val mode = MicInputMode.fromWire(intent.getStringExtra(EXTRA_MIC_MODE))
+            applyMicMode(mode, announce = true)
+            startForegroundSafely("まいく: ${micInputMode.wireValue}")
+            return START_STICKY
+        }
 
         if (intent?.action == ACTION_START_SCREEN_SHARE) {
             val resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
@@ -257,24 +367,22 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             }
             if (resultCode == Activity.RESULT_OK && data != null) {
                 mediaProjectionAuthorized = true
-                startForegroundSafely("がめんみらーりんぐ・おんせいにんしき かどうちゅう")
+                startForegroundSafely("がめんきょうゆう・まいく: ${micInputMode.wireValue}")
                 startScreenCapture(resultCode, data)
             } else {
                 mediaProjectionAuthorized = false
-                startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+                startForegroundSafely("まいく: ${micInputMode.wireValue}")
                 sendLog("がめんきゃぷちゃの きょかが えられませんでした")
             }
         } else {
-            val statusText = if (mediaProjection != null) {
-                "がめんみらーりんぐ・おんせいにんしき かどうちゅう"
-            } else {
-                "おんせいにんしき・すりーぷたいおう かどうちゅう"
+            startForegroundSafely("まいく: ${micInputMode.wireValue}")
+            if (autoShareOnStart && mediaProjection == null) {
+                triggerAutoScreenShareIfNeeded()
             }
-            startForegroundSafely(statusText)
         }
 
         autoStartLocalAiAtLaunch()
-        startSpeechRecognitionLoop()
+        applyMicMode(micInputMode, announce = false)
 
         if (!relayPollingStarted) {
             relayPollingStarted = true
@@ -287,6 +395,44 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
 
         return START_STICKY
+    }
+
+    private fun applyMicMode(mode: MicInputMode, announce: Boolean) {
+        micInputMode = mode
+        mainHandler.post {
+            when (mode) {
+                MicInputMode.SOG14_ONLY -> {
+                    startSpeechRecognitionLoop()
+                    sendLog("まいくもーど: SOG14ほんたいのみ")
+                    if (announce) speakHiragana("SOG14の ほんたいまいくのみを しようします")
+                }
+                MicInputMode.CONTROLLER_ONLY -> {
+                    stopSpeechRecognitionLoop()
+                    sendLog("まいくもーど: えんかくそうさがわまいくのみ")
+                    if (announce) speakHiragana("えんかくそうさがわの まいくのみを しようします")
+                }
+            }
+        }
+    }
+
+    private fun triggerAutoScreenShareIfNeeded() {
+        if (mediaProjection != null) return
+        val now = System.currentTimeMillis()
+        if (now - lastAutoSharePromptAt < 6000L) return
+        lastAutoSharePromptAt = now
+
+        wakeDeviceFromSleep()
+        sendLog("がめんきょうゆうを じどうかいしします")
+        mainHandler.post {
+            try {
+                val uiIntent = Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    action = ACTION_REQUEST_SCREEN_SHARE_UI
+                }
+                startActivity(uiIntent)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun startScreenCapture(resultCode: Int, data: Intent) {
@@ -306,7 +452,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                         stopScreenCapture()
                         mediaProjectionAuthorized = false
                         if (!isStopping) {
-                            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+                            startForegroundSafely("まいく: ${micInputMode.wireValue}")
                             sendLog("がめんみらーりんぐが しゅうりょうしました")
                         }
                     }
@@ -403,7 +549,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         } catch (e: SecurityException) {
             mediaProjectionAuthorized = false
             stopScreenCapture()
-            startForegroundSafely("おんせいにんしき・すりーぷたいおう かどうちゅう")
+            startForegroundSafely("まいく: ${micInputMode.wireValue}")
             sendLog("がめんきゃぷちゃけんげんえらー: ${e.message}")
         } catch (e: Exception) {
             stopScreenCapture()
@@ -465,9 +611,8 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     private fun handleIncomingPhoneCall(rawNumber: String) {
         phoneCallActive = true
-        startForegroundSafely("ちゃくしんたいおう・えーあいかどうちゅう")
+        startForegroundSafely("ちゃくしんたいおう・じぇみにれんけいちゅう")
         aiChatEnabled = true
-        autoStartLocalAiAtLaunch()
 
         val cleanNumber = rawNumber.filter { it.isDigit() || it == '+' }
         val hasContactsPerm = ContextCompat.checkSelfPermission(
@@ -484,13 +629,13 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         val announcement = when {
             matched != null -> {
                 val spokenName = HiraganaNormalizer.toHiragana(matched.name)
-                "ちゃくしんが あります。はっしんもとは $spokenName さん、でんわばんごうは $spokenDigits です。えーあいを じどうきどう しました。"
+                "ちゃくしんが あります。はっしんもとは $spokenName さん、でんわばんごうは $spokenDigits です。"
             }
             spokenDigits.isNotEmpty() -> {
-                "ちゃくしんが あります。でんわばんごうは $spokenDigits、れんらくさき みとうろくの ばんごうです。えーあいを じどうきどう しました。"
+                "ちゃくしんが あります。でんわばんごうは $spokenDigits、れんらくさき みとうろくの ばんごうです。"
             }
             else -> {
-                "ひつうち または ばんごうふめいの ちゃくしんが あります。えーあいを じどうきどう しました。"
+                "ひつうち または ばんごうふめいの ちゃくしんが あります。"
             }
         }
         sendLog("ちゃくしんけんち: $announcement")
@@ -500,59 +645,18 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     private fun onIncomingAppCallDetected(appName: String, detail: String) {
         if (isStopping) return
         phoneCallActive = true
-        startForegroundSafely("ちゃくしんたいおう・えーあいかどうちゅう")
+        startForegroundSafely("ちゃくしんたいおう・じぇみにれんけいちゅう")
         aiChatEnabled = true
-        autoStartLocalAiAtLaunch()
-        val msg = "$appName から ちゃくしんが あります。$detail。えーあいを じどうきどう しました。"
+        val msg = "$appName から ちゃくしんが あります。$detail。"
         sendLog(msg)
         speakHiragana(msg)
     }
 
-    private fun autoStartLocalAiAtLaunch(attempt: Int = 1) {
-        networkExecutor.execute {
-            if (isLocalAiReachable()) {
-                sendLog("ろーかるえーあい じどうれんけいかんりょう")
-                return@execute
-            }
-            sendLog("Termux ろーかるえーあい じどうきどうちゅう (${attempt}かいめ)")
-            try {
-                val runIntent = Intent("com.termux.RUN_COMMAND").apply {
-                    setClassName(PKG_TERMUX, "com.termux.app.RunCommandService")
-                    putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash")
-                    putExtra(
-                        "com.termux.RUN_COMMAND_ARGUMENTS",
-                        arrayOf("-lc", "/data/data/com.termux/files/home/start_llama.sh")
-                    )
-                    putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(runIntent)
-                } else {
-                    startService(runIntent)
-                }
-            } catch (_: Exception) {
-            }
-
-            if (attempt < 5 && !isStopping) {
-                mainHandler.postDelayed({ autoStartLocalAiAtLaunch(attempt + 1) }, 3000L)
-            }
-        }
-    }
-
-    private fun isLocalAiReachable(): Boolean {
-        val base = localAiUrl.trim().trimEnd('/').removeSuffix("/v1/chat/completions")
-        if (base.isBlank()) return false
-        return try {
-            val conn = (URL("$base/v1/models").openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 1500
-                readTimeout = 1500
-            }
-            val code = conn.responseCode
-            conn.disconnect()
-            code in 200..299
-        } catch (_: Exception) {
-            false
+    private fun autoStartLocalAiAtLaunch() {
+        if (geminiApiKey.isNotBlank()) {
+            sendLog("Gemini せつぞくせってい じゅんびかんりょう (${geminiModel})")
+        } else {
+            sendLog("Gemini APIきーが みせっていです")
         }
     }
 
@@ -567,7 +671,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
                 override fun onDone(utteranceId: String?) {
                     isSpeaking = false
-                    if (!isStopping) {
+                    if (!isStopping && micInputMode == MicInputMode.SOG14_ONLY) {
                         mainHandler.postDelayed({ restartSpeechRecognition() }, 350L)
                     }
                 }
@@ -575,7 +679,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     isSpeaking = false
-                    if (!isStopping) {
+                    if (!isStopping && micInputMode == MicInputMode.SOG14_ONLY) {
                         mainHandler.postDelayed({ restartSpeechRecognition() }, 350L)
                     }
                 }
@@ -584,12 +688,24 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun stopSpeechRecognitionLoop() {
+        try {
+            speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {
+        }
+        speechRecognizer = null
+    }
+
     private fun startSpeechRecognitionLoop() {
+        if (micInputMode != MicInputMode.SOG14_ONLY) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             sendLog("おんせいにんしきがつかえません")
             return
         }
         mainHandler.post {
+            if (micInputMode != MicInputMode.SOG14_ONLY) return@post
             if (speechRecognizer == null) {
                 speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
                     setRecognitionListener(object : RecognitionListener {
@@ -600,7 +716,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                         override fun onEndOfSpeech() {}
 
                         override fun onError(error: Int) {
-                            if (!isStopping && !isSpeaking) {
+                            if (!isStopping && !isSpeaking && micInputMode == MicInputMode.SOG14_ONLY) {
                                 mainHandler.postDelayed({ restartSpeechRecognition() }, 700L)
                             }
                         }
@@ -608,12 +724,12 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                         override fun onResults(results: Bundle?) {
                             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             val rawRecognized = matches?.firstOrNull()?.trim()
-                            if (!rawRecognized.isNullOrEmpty() && !isSpeaking) {
+                            if (!rawRecognized.isNullOrEmpty() && !isSpeaking && micInputMode == MicInputMode.SOG14_ONLY) {
                                 val hiraText = HiraganaNormalizer.toHiragana(rawRecognized)
-                                sendLog("おんせいにんしき: $hiraText")
+                                sendLog("おんせいにんしき(SOG14): $hiraText")
                                 handleVoiceCommand(hiraText, rawRecognized)
                             }
-                            if (!isStopping && !isSpeaking) {
+                            if (!isStopping && !isSpeaking && micInputMode == MicInputMode.SOG14_ONLY) {
                                 mainHandler.postDelayed({ restartSpeechRecognition() }, 350L)
                             }
                         }
@@ -652,15 +768,12 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        if (hiraText.contains("えーあいとはなしたい") || hiraText.contains("えーあいもーど")) {
-            aiChatEnabled = true
-            autoStartLocalAiAtLaunch()
-            speakHiragana("えーあいと はなす もーどに しました")
+        if (hiraText.contains("じぇみにまいく") || hiraText.contains("ほんたいまいくのみ")) {
+            applyMicMode(MicInputMode.SOG14_ONLY, announce = true)
             return
         }
-        if (hiraText.contains("えーあいをやめる") || hiraText.contains("つうじょうもーど")) {
-            aiChatEnabled = false
-            speakHiragana("えーあいもーどを しゅうりょうしました")
+        if (hiraText.contains("えんかくまいくのみ") || hiraText.contains("そうさがわまいく")) {
+            applyMicMode(MicInputMode.CONTROLLER_ONLY, announce = true)
             return
         }
 
@@ -725,15 +838,67 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        if (aiChatEnabled) {
-            networkExecutor.execute {
-                val reply = LocalAiClient.generateHiraganaReply(localAiUrl, localAiModel, hiraText)
-                if (!reply.isNullOrBlank()) {
-                    speakHiragana(HiraganaNormalizer.toHiragana(reply))
-                } else {
-                    speakHiragana("ろーかるえーあいに せつぞくできませんでした")
-                }
+        // 音声コマンドは接続先の SOG14 Gemini で処理
+        networkExecutor.execute {
+            val reply = querySog14Gemini(rawText)
+            if (!reply.isNullOrBlank()) {
+                val spoken = HiraganaNormalizer.toHiragana(reply)
+                sendLog("Gemini: $reply")
+                speakHiragana(spoken)
+            } else {
+                speakHiragana("SOG14の じぇみにに せつぞくできませんでした")
             }
+        }
+    }
+
+    private fun querySog14Gemini(promptText: String): String? {
+        if (geminiApiKey.isBlank() || promptText.isBlank()) return null
+        val modelName = geminiModel.trim().ifEmpty { "gemini-2.5-flash" }
+        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey.trim()}"
+        return try {
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8000
+                readTimeout = 15000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            val systemInstruction = JSONObject().apply {
+                put("parts", JSONArray().put(JSONObject().put("text", "あなたはAndroid端末SOG14上の音声アシスタントです。短くわかりやすく日本語で返答してください。")))
+            }
+            val userContent = JSONObject().apply {
+                put("role", "user")
+                put("parts", JSONArray().put(JSONObject().put("text", promptText)))
+            }
+            val bodyJson = JSONObject().apply {
+                put("system_instruction", systemInstruction)
+                put("contents", JSONArray().put(userContent))
+            }
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
+                it.write(bodyJson.toString())
+            }
+            val code = conn.responseCode
+            val text = if (code in 200..299) {
+                conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            }
+            conn.disconnect()
+            if (code !in 200..299) return null
+
+            val root = JSONObject(text)
+            val candidates = root.optJSONArray("candidates") ?: return null
+            val first = candidates.optJSONObject(0) ?: return null
+            val content = first.optJSONObject("content") ?: return null
+            val parts = content.optJSONArray("parts") ?: return null
+            val sb = StringBuilder()
+            for (i in 0 until parts.length()) {
+                val t = parts.optJSONObject(i)?.optString("text").orEmpty()
+                if (t.isNotBlank()) sb.append(t)
+            }
+            sb.toString().trim().ifEmpty { null }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -805,7 +970,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
         phoneCallActive = true
-        startForegroundSafely("つうちゅう・えーあいかどうちゅう")
+        startForegroundSafely("つうちゅう・じぇみにれんけいちゅう")
         startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:$phoneNumber")).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
         speakHiragana("$label に でんわを かけます")
     }
@@ -857,26 +1022,69 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                             put("role", "device")
                             put("device_id", deviceId)
                             put("token", token)
+                            put("mic_mode", micInputMode.wireValue)
                         }
                         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
                         val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                         conn.disconnect()
 
-                        val cmds: JSONArray? = JSONObject(body).optJSONArray("commands")
+                        val json = JSONObject(body)
+                        val cmds: JSONArray? = json.optJSONArray("commands")
                         if (cmds != null) {
                             for (i in 0 until cmds.length()) {
                                 val c = cmds.getJSONObject(i)
                                 mainHandler.post { handleRemoteRelayCommand(c) }
                             }
                         }
+
+                        // 操作側デバイスのカメラ・マイク・音声出力ストリーム受信
+                        val camFrame = json.optString("controller_camera_b64", "")
+                        if (camFrame.isNotEmpty()) {
+                            saveControllerCameraFrame(camFrame)
+                        }
+                        val micPcm = json.optString("controller_mic_pcm16_b64", "")
+                        if (micPcm.isNotEmpty() && micInputMode == MicInputMode.CONTROLLER_ONLY) {
+                            playControllerMicToSog14Speaker(micPcm)
+                        }
+                        val spkOut = json.optString("controller_speaker_pcm16_b64", "")
+                        if (spkOut.isNotEmpty()) {
+                            playControllerMicToSog14Speaker(spkOut)
+                        }
                     }
                 } catch (_: Exception) {
                 }
                 try {
-                    Thread.sleep(500L)
+                    Thread.sleep(400L)
                 } catch (_: InterruptedException) {
                     break
                 }
+            }
+        }
+    }
+
+    private fun saveControllerCameraFrame(base64Jpeg: String) {
+        mediaIoExecutor.execute {
+            try {
+                val bytes = Base64.decode(base64Jpeg, Base64.DEFAULT)
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@execute
+                val outFile = File(filesDir, "controller_camera_latest.jpg")
+                FileOutputStream(outFile).use { fos ->
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 70, fos)
+                }
+                bmp.recycle()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun playControllerMicToSog14Speaker(base64Pcm16: String) {
+        mediaIoExecutor.execute {
+            try {
+                val pcmBytes = Base64.decode(base64Pcm16, Base64.DEFAULT)
+                if (pcmBytes.isNotEmpty()) {
+                    speakerOutTrack?.write(pcmBytes, 0, pcmBytes.size)
+                }
+            } catch (_: Exception) {
             }
         }
     }
@@ -886,6 +1094,13 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         val w = metrics.widthPixels
         val h = metrics.heightPixels
         when (cmd.optString("type")) {
+            "auto_start_screen_share" -> {
+                triggerAutoScreenShareIfNeeded()
+            }
+            "set_mic_mode" -> {
+                val mode = MicInputMode.fromWire(cmd.optString("mode"))
+                applyMicMode(mode, announce = true)
+            }
             "amazon_order" -> {
                 val q = cmd.optString("query")
                 AmazonOrderHelper.openAmazonSearch(this, q)
@@ -927,7 +1142,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun restartSpeechRecognition() {
-        if (isStopping || isSpeaking) return
+        if (isStopping || isSpeaking || micInputMode != MicInputMode.SOG14_ONLY) return
         val recognizer = speechRecognizer ?: return
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -976,12 +1191,15 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         isStopping = true
         stopScreenCapture()
+        stopSpeechRecognitionLoop()
+        try {
+            speakerOutTrack?.stop()
+            speakerOutTrack?.release()
+        } catch (_: Exception) {
+        }
+        speakerOutTrack = null
         if (instance === this) instance = null
         AppNotificationListenerService.onNewNotificationCallback = null
-        mainHandler.post {
-            speechRecognizer?.destroy()
-            speechRecognizer = null
-        }
         LocalMusicPlayer.stop()
         tts?.stop()
         tts?.shutdown()
@@ -990,9 +1208,15 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         } catch (_: Exception) {
         }
+        try {
+            if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
+        } catch (_: Exception) {
+        }
         wakeLock = null
+        screenWakeLock = null
         networkExecutor.shutdownNow()
         screenUploadExecutor.shutdownNow()
+        mediaIoExecutor.shutdownNow()
         super.onDestroy()
     }
 
