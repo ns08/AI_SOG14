@@ -78,6 +78,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
         const val ACTION_STOP = "com.soni08.morseai.STOP"
         const val ACTION_INCOMING_CALL = "com.soni08.morseai.INCOMING_CALL"
+        const val ACTION_CALL_ENDED = "com.soni08.morseai.CALL_ENDED"
         const val ACTION_START_SCREEN_SHARE = "com.soni08.morseai.START_SCREEN_SHARE"
         const val ACTION_STOP_SCREEN_SHARE = "com.soni08.morseai.STOP_SCREEN_SHARE"
         const val ACTION_REQUEST_SCREEN_SHARE_UI = "com.soni08.morseai.REQUEST_SCREEN_SHARE_UI"
@@ -273,14 +274,18 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            if (phoneCallActive) {
+            val hasPhonePerm = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.READ_PHONE_STATE
+            ) == PackageManager.PERMISSION_GRANTED
+            if (phoneCallActive && hasPhonePerm) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
             }
-            if (mediaProjectionAuthorized) {
+            if (mediaProjectionAuthorized && mediaProjection != null) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             }
         } else {
-            if (mediaProjectionAuthorized) {
+            if (mediaProjectionAuthorized && mediaProjection != null) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             }
         }
@@ -300,6 +305,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 return
             } catch (_: SecurityException) {
                 mediaProjectionAuthorized = false
+                phoneCallActive = false
                 val fallbackType = computeForegroundServiceType()
                 try {
                     if (fallbackType != 0) {
@@ -309,19 +315,33 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                     }
                     return
                 } catch (_: SecurityException) {
-                    startForeground(NOTIF_ID, notification)
+                    try {
+                        startForeground(NOTIF_ID, notification)
+                    } catch (_: Exception) {
+                    }
                     return
                 }
             }
         }
-        startForeground(NOTIF_ID, notification)
+        try {
+            startForeground(NOTIF_ID, notification)
+        } catch (_: Exception) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            phoneCallActive = false
+            mediaProjectionAuthorized = false
             stopScreenCapture()
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (intent?.action == ACTION_CALL_ENDED) {
+            phoneCallActive = false
+            startForegroundSafely("まいくもーど: ${micInputMode.wireValue}")
+            return START_STICKY
         }
 
         if (intent?.action == ACTION_STOP_SCREEN_SHARE) {
@@ -365,9 +385,8 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
             }
+            startForegroundSafely("がめんきょうゆうじゅんびちゅう・まいく: ${micInputMode.wireValue}")
             if (resultCode == Activity.RESULT_OK && data != null) {
-                mediaProjectionAuthorized = true
-                startForegroundSafely("がめんきょうゆう・まいく: ${micInputMode.wireValue}")
                 startScreenCapture(resultCode, data)
             } else {
                 mediaProjectionAuthorized = false
@@ -442,9 +461,14 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             val projection = mpm?.getMediaProjection(resultCode, data)
             if (projection == null) {
                 mediaProjectionAuthorized = false
+                startForegroundSafely("まいく: ${micInputMode.wireValue}")
                 sendLog("MediaProjection の しゅとくにしっぱいしました")
                 return
             }
+
+            mediaProjection = projection
+            mediaProjectionAuthorized = true
+            startForegroundSafely("がめんきょうゆう・まいく: ${micInputMode.wireValue}")
 
             projection.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
@@ -542,7 +566,6 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                 mainHandler
             )
 
-            mediaProjection = projection
             imageReader = reader
             virtualDisplay = display
             sendLog("がめんみらーりんぐを かいししました (${captureW}x${captureH})")
@@ -552,7 +575,9 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             startForegroundSafely("まいく: ${micInputMode.wireValue}")
             sendLog("がめんきゃぷちゃけんげんえらー: ${e.message}")
         } catch (e: Exception) {
+            mediaProjectionAuthorized = false
             stopScreenCapture()
+            startForegroundSafely("まいく: ${micInputMode.wireValue}")
             sendLog("がめんみらーりんぐかいしえらー: ${e.message}")
         }
     }
@@ -606,6 +631,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         } catch (_: Exception) {
         }
         mediaProjection = null
+        mediaProjectionAuthorized = false
         isUploadingFrame = false
     }
 
@@ -838,7 +864,6 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        // 音声コマンドは接続先の SOG14 Gemini で処理
         networkExecutor.execute {
             val reply = querySog14Gemini(rawText)
             if (!reply.isNullOrBlank()) {
@@ -1037,7 +1062,6 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
                             }
                         }
 
-                        // 操作側デバイスのカメラ・マイク・音声出力ストリーム受信
                         val camFrame = json.optString("controller_camera_b64", "")
                         if (camFrame.isNotEmpty()) {
                             saveControllerCameraFrame(camFrame)
@@ -1190,6 +1214,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         isStopping = true
+        phoneCallActive = false
         stopScreenCapture()
         stopSpeechRecognitionLoop()
         try {
